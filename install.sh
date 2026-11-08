@@ -45,16 +45,31 @@ fi
 
 step "Installing the bar widget → $PLUGIN_DIR"
 # Real copies, not symlinks: `omarchy plugin validate` rejects symlinks.
+# Only files whose content or mode differs are copied, and the shell is only
+# asked to rescan when something changed: a rescan of every plugin keeps the
+# shell busy for a few seconds, timing out the next `omarchy plugin` command.
 mkdir -p "$PLUGIN_DIR"
-install -m 644 "$ROOT/manifest.json" "$PLUGIN_DIR/manifest.json"
-install -m 644 "$ROOT/BarWidget.qml" "$PLUGIN_DIR/BarWidget.qml"
-install -m 755 "$ROOT/aurwatch-toggle" "$PLUGIN_DIR/aurwatch-toggle"
+changed=0
+place() { # place <mode> <file>
+  local mode="$1" src="$ROOT/$2" dst="$PLUGIN_DIR/$2"
+  if [[ -f "$dst" ]] && cmp -s "$src" "$dst" && [[ "$(stat -c %a "$dst")" == "$mode" ]]; then
+    return 0
+  fi
+  install -m "$mode" "$src" "$dst"
+  echo "  updated $2"
+  changed=1
+}
+place 644 manifest.json
+place 644 BarWidget.qml
+place 755 aurwatch-toggle
 if command -v omarchy >/dev/null 2>&1; then
   omarchy plugin validate "$PLUGIN_DIR"
 fi
-# Let a running shell pick up new or changed plugin files.
-if command -v omarchy-shell >/dev/null 2>&1; then
+if ((changed)) && command -v omarchy-shell >/dev/null 2>&1; then
+  echo "  rescanning plugins"
   omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
+elif ((!changed)); then
+  echo "  plugin files unchanged, no rescan needed"
 fi
 
 # First data for the widget, if there's none yet.
@@ -63,11 +78,21 @@ if ! "$HOME/.local/bin/aurwatch" summary | grep -q '"have_data":true'; then
   "$HOME/.local/bin/aurwatch" fetch
 fi
 
-if ((enable_widget)); then
+# Read the bar layout from the shell's config instead of asking the shell,
+# which may still be busy with a rescan.
+in_bar() {
+  local cfg="$HOME/.config/omarchy/shell.json"
+  [[ -f "$cfg" ]] && command -v jq >/dev/null 2>&1 &&
+    jq -e --arg id "$PLUGIN_ID" '[.bar.layout[]?[]?.id?] | index($id) != null' "$cfg" >/dev/null 2>&1
+}
+
+echo
+if in_bar; then
+  echo "The widget is in the bar. To remove it: omarchy plugin disable $PLUGIN_ID"
+elif ((enable_widget)); then
   step "Adding the widget to the bar"
   omarchy plugin enable "$PLUGIN_ID" --section right
 else
-  echo
   echo "Widget installed but not in the bar yet. To add it:"
   echo "  omarchy plugin enable $PLUGIN_ID --section right"
 fi
