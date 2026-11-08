@@ -1,0 +1,11 @@
+[Unit]
+Description=aurwatch: fetch package stats every 6 hours
+
+[Timer]
+# Every 6 hours; Persistent catches up on a run missed while powered off.
+OnCalendar=*-*-* 00/6:00:00
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

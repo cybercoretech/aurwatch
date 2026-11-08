@@ -1,0 +1,8 @@
+[Unit]
+Description=aurwatch: fetch AUR and GitHub stats for your packages
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/aurwatch fetch
