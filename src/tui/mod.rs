@@ -17,6 +17,11 @@ pub fn run() -> Result<()> {
     let mut app = App::new()?;
     // ratatui::init installs a panic hook that restores the terminal.
     let mut terminal = ratatui::init();
+    // Window title for the terminal (and the Hyprland window the widget opens).
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        ratatui::crossterm::terminal::SetTitle("aurwatch")
+    );
     let result = (|| -> Result<()> {
         while !app.quit {
             app.poll();

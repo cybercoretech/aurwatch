@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Bar-widget helper for aurwatch (same role as cyberwatch-toggle).
+#
+#   aurwatch-toggle            open the TUI in a floating, centered terminal,
+#                              or focus it if it's already open
+#   aurwatch-toggle --summary  print the JSON digest the widget polls (no network)
+#   aurwatch-toggle --refresh  fetch now, in the background
+#
+# Uses the one installed binary (the timer and CLI use it too), so the widget
+# never runs a stale bundled copy. It never downloads or builds anything; if
+# the binary is missing it says how to install it.
+set -euo pipefail
+
+APP_ID="org.cybercore.aurwatch"
+WIDTH="${AURWATCH_WIDTH:-1180}"
+HEIGHT="${AURWATCH_HEIGHT:-680}"
+
+notify() {
+  command -v notify-send >/dev/null 2>&1 && notify-send -a aurwatch "aurwatch" "$1" || true
+  echo "aurwatch-toggle: $1" >&2
+}
+
+resolve_bin() {
+  local c
+  for c in "${AURWATCH_BIN:-}" "$(command -v aurwatch 2>/dev/null || true)" "$HOME/.local/bin/aurwatch"; do
+    if [[ -n "$c" && -x "$c" ]]; then
+      echo "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if ! BIN="$(resolve_bin)"; then
+  if [[ "${1:-}" == "--summary" ]]; then
+    # The widget shows "not installed" instead of spamming notifications every poll.
+    echo '{"have_data":false,"missing_binary":true}'
+    exit 0
+  fi
+  notify "aurwatch isn't installed. Run install.sh in the aurwatch repo."
+  exit 1
+fi
+
+case "${1:-}" in
+  --summary)
+    exec "$BIN" summary
+    ;;
+  --refresh)
+    # Prefer the timer's service: systemd won't start a second copy while one runs.
+    if systemctl --user cat aurwatch-fetch.service >/dev/null 2>&1; then
+      exec systemctl --user start --no-block aurwatch-fetch.service
+    fi
+    setsid "$BIN" fetch >/dev/null 2>&1 &
+    exit 0
+    ;;
+  "") ;;
+  *)
+    echo "usage: aurwatch-toggle [--summary|--refresh]" >&2
+    exit 2
+    ;;
+esac
+
+window_address() {
+  hyprctl clients -j 2>/dev/null |
+    jq -r --arg id "$APP_ID" '.[] | select(.class == $id or .initialClass == $id) | .address' |
+    head -n1
+}
+
+# Already open: bring it here and focus it.
+if addr="$(window_address)" && [[ -n "$addr" ]]; then
+  ws="$(hyprctl activeworkspace -j 2>/dev/null | jq -r '.id // empty')"
+  [[ -n "$ws" ]] && hyprctl dispatch movetoworkspacesilent "$ws,address:$addr" >/dev/null 2>&1 || true
+  hyprctl dispatch "hl.dsp.focus({ window = \"address:$addr\" })" >/dev/null 2>&1 ||
+    hyprctl dispatch focuswindow "address:$addr" >/dev/null 2>&1 || true
+  exit 0
+fi
+
+# Omarchy's launcher picks the user's terminal and styling.
+if command -v omarchy-launch-tui >/dev/null 2>&1; then
+  omarchy-launch-tui "--app-id=$APP_ID" "$BIN" >/dev/null 2>&1 &
+else
+  setsid xdg-terminal-exec "--app-id=$APP_ID" -e "$BIN" >/dev/null 2>&1 &
+fi
+
+# Float, size and center it once the window exists (same Lua dispatch style
+# as the CrateStats plugin on this machine).
+for _ in $(seq 1 80); do
+  if addr="$(window_address)" && [[ -n "$addr" ]]; then
+    hyprctl eval \
+      "hl.dispatch(hl.dsp.window.float({ action = \"float\", window = \"address:$addr\" })); \
+       hl.dispatch(hl.dsp.window.resize({ x = $WIDTH, y = $HEIGHT, relative = false, window = \"address:$addr\" })); \
+       hl.dispatch(hl.dsp.window.center({ window = \"address:$addr\" }))" \
+      >/dev/null 2>&1 || true
+    exit 0
+  fi
+  sleep 0.05
+done
+notify "the aurwatch window didn't appear"
+exit 1

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "custom.aurwatch",
+  "name": "aurwatch",
+  "version": "0.1.0",
+  "author": "darkstardevx",
+  "license": "MIT",
+  "description": "Your AUR packages at a glance: downloads, votes and alerts (flagged out-of-date, unpackaged releases) in the bar, with a full TUI on click. Personal use, not marketplace-listed.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "aurwatch",
+    "description": "AUR package downloads, votes and alerts",
+    "category": "Developer Tools",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

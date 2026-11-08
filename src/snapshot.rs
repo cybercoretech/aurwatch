@@ -47,6 +47,91 @@ impl PackageStats {
         let tag = self.latest_release.as_deref()?;
         (github::tag_version(tag) != pkgver(&self.version)).then_some(tag)
     }
+
+    /// What needs the maintainer's attention, as short phrases. Empty means fine.
+    pub fn alerts(&self) -> Vec<String> {
+        let mut a = Vec::new();
+        if self.out_of_date_since.is_some() {
+            a.push("flagged out-of-date".into());
+        }
+        if let Some(tag) = self.unpackaged_release() {
+            a.push(format!("{tag} not packaged"));
+        }
+        if self.maintainer.is_none() {
+            a.push("orphaned".into());
+        }
+        a
+    }
+}
+
+/// Snapshots older than this mean the timer (every 6h) missed two runs.
+pub const STALE_SECS: i64 = 13 * 3600;
+
+/// Compact, network-free digest of `latest.json` for the bar widget.
+#[derive(Debug, Serialize)]
+pub struct Summary {
+    pub have_data: bool,
+    pub fetched_at: i64,
+    pub age_secs: i64,
+    pub stale: bool,
+    pub packages: usize,
+    pub votes: u32,
+    /// Linux release-asset downloads across `-bin` packages, all releases.
+    pub downloads: u64,
+    /// Sum over `-bin` packages that have 7 days of history; `None` before that.
+    pub downloads_7d: Option<u64>,
+    pub alerts: usize,
+    /// One line per package, for the tooltip.
+    pub lines: Vec<String>,
+}
+
+impl Summary {
+    pub fn from_snapshot(snap: Option<&Snapshot>, now: i64) -> Self {
+        let Some(s) = snap else {
+            return Self {
+                have_data: false,
+                fetched_at: 0,
+                age_secs: 0,
+                stale: true,
+                packages: 0,
+                votes: 0,
+                downloads: 0,
+                downloads_7d: None,
+                alerts: 0,
+                lines: Vec::new(),
+            };
+        };
+        let bins = || s.packages.iter().filter_map(|p| p.downloads.as_ref());
+        let week: Vec<u64> = bins().filter_map(|d| d.last_7d).collect();
+        let lines = s
+            .packages
+            .iter()
+            .map(|p| {
+                let mut l = format!("{}  {}  ★{}", p.name, p.version, p.votes);
+                if let Some(d) = &p.downloads {
+                    l.push_str(&format!("  ↓{}", d.all_releases));
+                }
+                let alerts = p.alerts();
+                if !alerts.is_empty() {
+                    l.push_str(&format!("  ⚠ {}", alerts.join(", ")));
+                }
+                l
+            })
+            .collect();
+        let age_secs = (now - s.fetched_at).max(0);
+        Self {
+            have_data: true,
+            fetched_at: s.fetched_at,
+            age_secs,
+            stale: age_secs > STALE_SECS,
+            packages: s.packages.len(),
+            votes: s.packages.iter().map(|p| p.votes).sum(),
+            downloads: bins().map(|d| d.all_releases).sum(),
+            downloads_7d: (!week.is_empty()).then(|| week.iter().sum()),
+            alerts: s.packages.iter().filter(|p| !p.alerts().is_empty()).count(),
+            lines,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,5 +409,65 @@ mod tests {
         assert_eq!(pkgver("0.4.1-1"), "0.4.1");
         assert_eq!(pkgver("1:2.0-3"), "2.0");
         assert_eq!(pkgver("0.1.0"), "0.1.0");
+    }
+
+    fn pkg(
+        name: &str,
+        version: &str,
+        dl: Option<(u64, Option<u64>)>,
+        tag: Option<&str>,
+    ) -> PackageStats {
+        PackageStats {
+            name: name.into(),
+            base: name.into(),
+            version: version.into(),
+            description: None,
+            maintainer: Some("me".into()),
+            votes: 2,
+            popularity: 0.0,
+            out_of_date_since: None,
+            first_submitted: 0,
+            last_modified: 0,
+            aur_url: String::new(),
+            upstream_url: None,
+            github_repo: None,
+            downloads: dl.map(|(all, week)| Downloads {
+                current_release: Some(all),
+                all_releases: all,
+                last_7d: week,
+                last_30d: None,
+            }),
+            latest_release: tag.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn summary_digest() {
+        let empty = Summary::from_snapshot(None, 100);
+        assert!(!empty.have_data && empty.stale && empty.lines.is_empty());
+
+        let mut orphan = pkg("old", "1.0-1", None, None);
+        orphan.maintainer = None;
+        let snap = Snapshot {
+            fetched_at: 1000,
+            maintainer: "me".into(),
+            packages: vec![
+                pkg("a", "0.4.1-1", None, Some("v0.4.1")),
+                pkg("a-bin", "0.4.1-1", Some((30, Some(4))), Some("v0.5.0")),
+                pkg("b-bin", "0.1.0-1", Some((20, None)), None),
+                orphan,
+            ],
+            repos: BTreeMap::new(),
+        };
+        let s = Summary::from_snapshot(Some(&snap), 1000 + 3600);
+        assert_eq!(
+            (s.packages, s.votes, s.downloads, s.downloads_7d),
+            (4, 8, 50, Some(4))
+        );
+        assert_eq!(s.alerts, 2); // a-bin (v0.5.0 not packaged) and old (orphaned)
+        assert!(!s.stale && s.age_secs == 3600);
+        assert_eq!(s.lines[1], "a-bin  0.4.1-1  ★2  ↓30  ⚠ v0.5.0 not packaged");
+        assert_eq!(s.lines[0], "a  0.4.1-1  ★2");
+        assert!(Summary::from_snapshot(Some(&snap), 1000 + STALE_SECS + 1).stale);
     }
 }

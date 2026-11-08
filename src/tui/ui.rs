@@ -69,17 +69,7 @@ fn block<'a>(title: &'a str, t: &Theme) -> Block<'a> {
 
 /// Short notes for a package row: what needs attention, if anything.
 fn notes(p: &PackageStats) -> Vec<(String, bool)> {
-    let mut n = Vec::new();
-    if p.out_of_date_since.is_some() {
-        n.push(("flagged out-of-date".into(), true));
-    }
-    if let Some(tag) = p.unpackaged_release() {
-        n.push((format!("{tag} not packaged"), true));
-    }
-    if p.maintainer.is_none() {
-        n.push(("orphaned".into(), true));
-    }
-    n
+    p.alerts().into_iter().map(|a| (a, true)).collect()
 }
 
 fn draw_header(f: &mut Frame, app: &App, t: &Theme, area: Rect) {

@@ -34,6 +34,8 @@ enum Cmd {
         #[arg(long)]
         no_github: bool,
     },
+    /// Print a compact JSON digest of the last fetch, for the bar widget (no network).
+    Summary,
     /// Print the config file path.
     Config,
 }
@@ -113,6 +115,11 @@ fn main() -> Result<()> {
     match Cli::parse().cmd.unwrap_or(Cmd::Tui) {
         Cmd::Tui => tui::run()?,
         Cmd::Config => println!("{}", config::path()?.display()),
+        Cmd::Summary => {
+            let snap = snapshot::load_latest().unwrap_or(None);
+            let summary = snapshot::Summary::from_snapshot(snap.as_ref(), snapshot::now());
+            println!("{}", serde_json::to_string(&summary)?);
+        }
         Cmd::Fetch { json, no_github } => {
             let (snap, _) = snapshot::fetch_and_save(!no_github)?;
             if json {
