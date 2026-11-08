@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
+cybercore = { git = "https://github.com/cybercoretech/cybercore", tag = "v0.8.3", version = "0.8.3" }
 dirs = "7.0.0"
+ratatui = "0.30"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 toml = "1.2.1"

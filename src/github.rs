@@ -1,4 +1,4 @@
-//! GitHub stats via the `gh` CLI, so aurwatch reuses the user's existing auth.
+//! GitHub stats over the REST API, authenticated with the user's existing `gh` login.
 //!
 //! - Release asset `download_count`: the closest thing to AUR downloads, but
 //!   only for `-bin` packages, whose PKGBUILD fetches a release asset. Source
@@ -6,26 +6,79 @@
 //! - Traffic (views/clones): GitHub repo traffic, not AUR page views. Needs
 //!   push access, and covers only the last 14 days, so `history` keeps the
 //!   per-day breakdown to build longer history.
+//!
+//! The token comes from `GH_TOKEN`/`GITHUB_TOKEN`, else one `gh auth token`
+//! call. Requests then go straight to api.github.com: one `gh` subprocess per
+//! request was slow, and parallel runs of a wrapped `gh` (mise shims) could hang.
 
-use std::process::Command;
+use std::{
+    io::Read,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-fn gh_api<T: DeserializeOwned>(path: &str) -> Result<T> {
-    let out = Command::new("gh")
-        .args(["api", "-H", "Accept: application/vnd.github+json", path])
-        .output()
-        .context("running `gh` (is the GitHub CLI installed?)")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let line = err
-            .lines()
-            .rfind(|l| !l.trim().is_empty())
-            .unwrap_or("failed");
-        bail!("gh api {path}: {}", line.trim());
+const API: &str = "https://api.github.com";
+const TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A GitHub token: env var first, then `gh auth token` (killed after 15s).
+pub fn token() -> Result<String> {
+    for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(t) = std::env::var(var)
+            && !t.trim().is_empty()
+        {
+            return Ok(t.trim().to_string());
+        }
     }
-    serde_json::from_slice(&out.stdout).with_context(|| format!("decoding gh api {path}"))
+    let mut child = Command::new("gh")
+        .args(["auth", "token"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running `gh auth token` (is the GitHub CLI installed?)")?;
+    let start = Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break s;
+        }
+        if start.elapsed() > TOKEN_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "`gh auth token` timed out after {}s",
+                TOKEN_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let mut out = String::new();
+    child.stdout.take().map(|mut o| o.read_to_string(&mut out));
+    if !status.success() || out.trim().is_empty() {
+        let mut err = String::new();
+        child.stderr.take().map(|mut e| e.read_to_string(&mut err));
+        bail!("`gh auth token` failed: {}", err.trim());
+    }
+    Ok(out.trim().to_string())
+}
+
+fn api<T: DeserializeOwned>(agent: &ureq::Agent, token: &str, path: &str) -> Result<T> {
+    let resp = agent
+        .get(&format!("{API}/{path}"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .call();
+    match resp {
+        Ok(mut r) => r
+            .body_mut()
+            .read_json()
+            .with_context(|| format!("decoding {path}")),
+        Err(ureq::Error::StatusCode(code)) => Err(anyhow!("{path}: HTTP {code}")),
+        Err(e) => Err(anyhow!("{path}: {e}")),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,7 +91,23 @@ pub struct Asset {
 pub struct Release {
     pub tag_name: String,
     pub draft: bool,
+    #[serde(default)]
+    pub prerelease: bool,
     pub assets: Vec<Asset>,
+}
+
+/// Newest published, non-prerelease tag (GitHub lists releases newest first).
+pub fn latest_tag(releases: &[Release]) -> Option<&str> {
+    releases
+        .iter()
+        .find(|r| !r.prerelease)
+        .map(|r| r.tag_name.as_str())
+}
+
+/// `v1.2.3` / `cli-v1.2.3` / `1.2.3` -> `1.2.3`
+pub fn tag_version(tag: &str) -> &str {
+    tag.find(|c: char| c.is_ascii_digit())
+        .map_or(tag, |i| &tag[i..])
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,13 +151,13 @@ pub struct RepoStats {
     pub errors: Vec<String>,
 }
 
-pub fn repo_stats(repo: &str) -> RepoStats {
+pub fn repo_stats(agent: &ureq::Agent, token: &str, repo: &str) -> RepoStats {
     let mut s = RepoStats::default();
-    match gh_api::<Vec<Release>>(&format!("repos/{repo}/releases?per_page=100")) {
+    match api::<Vec<Release>>(agent, token, &format!("repos/{repo}/releases?per_page=100")) {
         Ok(r) => s.releases = Some(r.into_iter().filter(|r| !r.draft).collect()),
         Err(e) => s.errors.push(e.to_string()),
     }
-    match gh_api::<ViewsResp>(&format!("repos/{repo}/traffic/views")) {
+    match api::<ViewsResp>(agent, token, &format!("repos/{repo}/traffic/views")) {
         Ok(v) => {
             s.views = Some(Traffic {
                 count: v.count,
@@ -98,7 +167,7 @@ pub fn repo_stats(repo: &str) -> RepoStats {
         }
         Err(e) => s.errors.push(e.to_string()),
     }
-    match gh_api::<ClonesResp>(&format!("repos/{repo}/traffic/clones")) {
+    match api::<ClonesResp>(agent, token, &format!("repos/{repo}/traffic/clones")) {
         Ok(c) => {
             s.clones = Some(Traffic {
                 count: c.count,
@@ -165,6 +234,7 @@ mod tests {
         Release {
             tag_name: tag.into(),
             draft: false,
+            prerelease: false,
             assets: assets
                 .iter()
                 .map(|(n, c)| Asset {
@@ -193,6 +263,18 @@ mod tests {
         assert!(!is_linux_artifact(
             "hermes-v0.2.1-x86_64-unknown-linux-gnu.tar.gz.sigstore.json"
         ));
+    }
+
+    #[test]
+    fn latest_and_tag_versions() {
+        let mut pre = rel("v0.5.0-rc1", &[]);
+        pre.prerelease = true;
+        let rels = vec![pre, rel("cli-v0.4.1", &[]), rel("v0.4.0", &[])];
+        assert_eq!(latest_tag(&rels), Some("cli-v0.4.1"));
+        assert_eq!(latest_tag(&[]), None);
+        assert_eq!(tag_version("cli-v0.4.1"), "0.4.1");
+        assert_eq!(tag_version("v1.0"), "1.0");
+        assert_eq!(tag_version("2.0.0"), "2.0.0");
     }
 
     #[test]

@@ -54,7 +54,7 @@ impl History {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        crate::write_atomic(path, &serde_json::to_string_pretty(self)?)
+        crate::snapshot::write_atomic(path, &serde_json::to_string_pretty(self)?)
     }
 
     /// Merge GitHub's 14-day views and clones windows for one repo.
@@ -106,6 +106,47 @@ impl History {
             )
         })
     }
+
+    /// Downloads per day for the `n` days ending `today` (oldest first). Each
+    /// day gets its total minus the previous recorded total, so a gap in
+    /// history lands on the first day after it. Days without data are 0.
+    pub fn downloads_per_day(&self, package: &str, today: &str, n: i64) -> Vec<u64> {
+        let Some(rows) = self.daily.get(package) else {
+            return vec![0; n as usize];
+        };
+        last_n_days(today, n)
+            .iter()
+            .map(|d| {
+                let Some(cur) = rows.get(d).and_then(|r| r.downloads_total) else {
+                    return 0;
+                };
+                rows.range(..d.clone())
+                    .rev()
+                    .find_map(|(_, r)| r.downloads_total)
+                    .map_or(0, |prev| cur.saturating_sub(prev))
+            })
+            .collect()
+    }
+
+    /// (views, clones) per day for the `n` days ending `today`, oldest first.
+    pub fn traffic_per_day(&self, repo: &str, today: &str, n: i64) -> (Vec<u64>, Vec<u64>) {
+        let days = self.traffic.get(repo);
+        last_n_days(today, n)
+            .iter()
+            .map(|d| {
+                days.and_then(|t| t.get(d))
+                    .map_or((0, 0), |r| (r.views, r.clones))
+            })
+            .unzip()
+    }
+}
+
+/// The `n` dates ending at `today`, oldest first.
+fn last_n_days(today: &str, n: i64) -> Vec<String> {
+    (0..n)
+        .rev()
+        .filter_map(|back| shift_date(today, -back))
+        .collect()
 }
 
 fn date_of(ts: &str) -> String {
@@ -141,7 +182,7 @@ pub fn date_from_unix(secs: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-fn shift_date(date: &str, days: i64) -> Option<String> {
+pub fn shift_date(date: &str, days: i64) -> Option<String> {
     let mut it = date.splitn(3, '-');
     let (y, m, d) = (
         it.next()?.parse().ok()?,
@@ -230,6 +271,32 @@ mod tests {
                 popularity: 0.1,
                 downloads_total: Some(30)
             }
+        );
+    }
+
+    #[test]
+    fn per_day_series() {
+        let mut h = History::default();
+        let row = |n| DailyRow {
+            votes: 0,
+            popularity: 0.0,
+            downloads_total: Some(n),
+        };
+        h.record_daily("p", "2026-11-01", row(10));
+        h.record_daily("p", "2026-11-02", row(12));
+        // 11-03 missing: its downloads land on 11-04
+        h.record_daily("p", "2026-11-04", row(20));
+        assert_eq!(h.downloads_per_day("p", "2026-11-04", 4), vec![0, 2, 0, 8]);
+        assert_eq!(h.downloads_per_day("missing", "2026-11-04", 2), vec![0, 0]);
+
+        h.merge_traffic(
+            "o/r",
+            Some(&traffic(&[("2026-11-03", 5)])),
+            Some(&traffic(&[("2026-11-04", 9)])),
+        );
+        assert_eq!(
+            h.traffic_per_day("o/r", "2026-11-04", 3),
+            (vec![0, 5, 0], vec![0, 0, 9])
         );
     }
 }
